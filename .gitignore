@@ -1,0 +1,5 @@
+*.o
+*.log
+*.out
+m8.web_bench
+mul_client
