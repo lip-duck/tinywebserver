@@ -550,6 +550,7 @@ public:
             perror("epoll_ctl");
             return;  // 不要exit()
         }
+        channels_[fd] = ch;  // 【修复】把 ch 存到 channels_ 数组
     }
 
     void deletechannel(channel* ch) {
@@ -1159,21 +1160,9 @@ void process_request(int fd, Httprequest* req, channel* ch) {
 
             // 4. 【粘包处理】检查 buffer_ 里是否还有完整的请求
             //    如果有，立即提交任务处理（不需要等新的网络数据）
-            if (req->parse("", 0)) {            // 传空数据，只解析 buffer_ 里的剩余数据
-                g_loop->remove_from_epoll(ch);  // 处理期间暂时移除
-                g_pool->submit([fd]() {
-                    // 只捕获fd
-                    channel* ch = g_loop->get_channel(fd);
-                    if (!ch) return;
-                    Httprequest* req;
-                    {
-                        std::lock_guard<std::mutex> lock(g_http_mutex);
-                        auto it = g_http_requests.find(fd);
-                        if (it == g_http_requests.end()) return;
-                        req = it->second;
-                    }
-                    process_request(fd, req, ch);
-                });
+            if (req->parse("", 0)) {
+                g_loop->remove_from_epoll(ch);
+                process_request(fd, req, ch);
             }
         });
     });
@@ -1212,8 +1201,7 @@ void handle_read(channel* ch) {
             g_loop->deletechannel(ch);
             g_loop->delete_timer(fd);
             close(fd);
-            delete req;
-            delete ch;
+            // 不 delete ch 和 req，标记待删除，让 handle_expired 统一清理
             {
                 std::lock_guard<std::mutex> lock(g_http_mutex);
                 g_http_requests.erase(fd);
@@ -1227,8 +1215,7 @@ void handle_read(channel* ch) {
                 g_loop->remove_from_epoll(ch);
                 g_loop->delete_timer(fd);
                 close(fd);
-                delete ch;
-                delete req;
+                // 不 delete ch 和 req，让 close_connection 统一清理
                 {
                     std::lock_guard<std::mutex> lock(g_http_mutex);
                     g_http_requests.erase(fd);
@@ -1240,11 +1227,9 @@ void handle_read(channel* ch) {
         bool done = req->parse(buf, n);
         if (done) {
             LOG_INFO("parse done, fd=%d, submitting to pool", fd);
-            // 解析完成，提交任务给线程池
-            g_loop->remove_from_epoll(ch);  // 短连接模式
+            g_loop->remove_from_epoll(ch);
             g_pool->submit([fd]() {
                 channel* ch = g_loop->get_channel(fd);
-                fprintf(stderr, "WORKER fd=%d ch=%p\n", fd, (void*)ch);
                 if (!ch) return;
                 Httprequest* req;
                 {
