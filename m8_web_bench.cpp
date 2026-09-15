@@ -3,6 +3,8 @@
 #include <fcntl.h>
 #include <mysql/mysql.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <signal.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -14,6 +16,7 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -28,10 +31,13 @@
 #include <unordered_map>
 #include <vector>
 
-#define MAX_EVENTS 1024
+#define MAX_EVENTS 4096
 #define MAX_FDS 65535
 #define connpool_size 8
 #define threadpool_size 4
+
+// 【新增】非 HTTP 流量（压测客户端发的裸文本）请求行缓冲上限，防止 buffer 无限增长
+#define GARBAGE_BUF_LIMIT 4096
 
 // 宏定义，方便调用
 #define LOG_DEBUG(fmt, ...) Logger::instance().log(Logger::DEBUG, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
@@ -146,9 +152,23 @@ public:
     // 初始化：打开日志文件
     void init(const char* filename) {
         fp_ = fopen(filename, "a");         // append 模式
-        next_buffer_.reserve(4096 * 1000);  // 【新增】备用缓冲区也预分配
+        next_buffer_.reserve(4096 * 1000);  // 备用缓冲区也预分配
         running_ = true;
-        backend_thread_ = std::thread(&Logger::backend_thread_func, this);  // 【新增】
+        backend_thread_ = std::thread(&Logger::backend_thread_func, this);
+
+        // 【新增】日志级别过滤：默认 INFO，可用环境变量 M8_LOG_LEVEL=DEBUG 打开
+        // 原来 m8 每个请求打 5 条 INFO，server.log 两天涨到 136MB，也拖慢压测
+        const char* env = getenv("M8_LOG_LEVEL");
+        if (env) {
+            if (strcmp(env, "DEBUG") == 0)
+                level_ = DEBUG;
+            else if (strcmp(env, "INFO") == 0)
+                level_ = INFO;
+            else if (strcmp(env, "WARN") == 0)
+                level_ = WARN;
+            else if (strcmp(env, "ERROR") == 0)
+                level_ = ERROR;
+        }
     }
 
     // 日志级别
@@ -161,6 +181,8 @@ public:
 
     // 写日志（变参函数）
     void log(Level level, const char* file, int line, const char* fmt, ...) {
+        if (level < level_) return;  // 【新增】低于设定级别的直接丢弃
+
         // 1. 获取当前时间，格式：2026-09-12 14:30:45
         char timebuf[32];
         time_t now = time(nullptr);
@@ -216,7 +238,7 @@ public:
                 buffers_to_write_.push_back(std::move(current_buffer_));
                 current_buffer_ = std::move(next_buffer_);
 
-                // 【新增】确保新的 current_buffer_ 有空间
+                // 确保新的 current_buffer_ 有空间
                 if (current_buffer_.capacity() == 0) {
                     current_buffer_.reserve(4096 * 1000);
                 }
@@ -238,7 +260,7 @@ public:
     }
 
 private:
-    Logger() : fp_(nullptr) {
+    Logger() : fp_(nullptr), level_(INFO) {
         current_buffer_.reserve(4096 * 1000);  // 预分配 4MB
     }
     ~Logger() {
@@ -255,6 +277,7 @@ private:
         if (fp_) fclose(fp_);
     }
     FILE* fp_;
+    Level level_;  // 【新增】低于此级别的不落盘
 
     Buffer current_buffer_;                 // 当前正在写的
     Buffer next_buffer_;                    // 备用的
@@ -362,83 +385,13 @@ public:
     void set_in_epoll(bool v) { in_epoll_ = v; }
     bool in_epoll() const { return in_epoll_; }
 
-    /*
-    void setwritecallback(std::function<void()> cb) {
-        writecallback_ = std::move(cb);
-    }
-        void setwriteevents() {
-        events_ |= EPOLLOUT;
-    }
-    */
     void set_close_callback(std::function<void()> cb) {
         close_callback_ = std::move(cb);
     }
-    // 外部调用send
-    void write(const std::string& data) {
-        if (!write_buf.empty()) {
-            write_buf += data;
-            return;
-        }
-
-        int n_sent = send(fd_, data.c_str(), data.size(), 0);
-
-        if (n_sent == -1) {
-            // send出错
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                write_buf = data;
-                enable_write();
-            } else {
-                perror("send");
-            }
-            return;
-        }
-
-        if (n_sent < (int)data.size()) {
-            write_buf += data.substr(n_sent);
-            enable_write();
-        }
-
-        // 情况4：全部发完了
-        if (n_sent == (int)data.size()) {
-            if (close_after_write_ && close_callback_) {
-                close_callback_();  // 【新增】全部发完了，直接关闭
-            }
-        }
-    }
-
+    // 外部调用send（定义在 eventloop 之后，因为要调 g_loop->close_connection）
+    void write(const std::string& data);
     // 处理writebuf
-    void handle_write() {
-        if (write_buf.empty()) {
-            disable_write();
-            return;
-        }
-
-        // 发送缓冲区里的数据
-        int n_sent = send(fd_, write_buf.c_str(), write_buf.size(), 0);
-
-        if (n_sent == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;  // 又满了，等下一次 EPOLLOUT
-            }
-            perror("send");
-            return;
-        }
-
-        // 移除已发送的部分
-        write_buf.erase(0, n_sent);
-
-        // 发完了
-        if (write_buf.empty()) {
-            disable_write();  // 【关键】取消 EPOLLOUT，否则 LT 模式下一直触发，CPU 100%
-
-            // 短连接：发完后关闭
-            if (close_after_write_) {
-                if (close_callback_) {
-                    close_callback_();  // 调用清理回调（close fd、delete 等）
-                }
-            }
-        }
-    }
+    void handle_write();
 
     // handle events
     void handle_events() {
@@ -489,13 +442,13 @@ public:
         }
         looping_ = false;
 
-        // 【新增】创建 eventfd 唤醒 fd
+        // 创建 eventfd 唤醒 fd
         wakeup_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         if (wakeup_fd_ == -1) {
             perror("eventfd");
             exit(1);
         }
-        // 【新增】把 wakeup_fd 包装成 channel，加入 epoll
+        // 把 wakeup_fd 包装成 channel，加入 epoll
         wakeup_channel_ = new channel(wakeup_fd_);
         wakeup_channel_->setreadevents();
         wakeup_channel_->setreadcallback([this]() {
@@ -511,6 +464,11 @@ public:
 
     // 【核心方法】把任务丢回主线程执行
     void runInLoop(std::function<void()> task) {
+        // 【新增】如果本来就在主循环线程里，直接执行，不用等下一轮 wakeup
+        if (std::this_thread::get_id() == loop_tid_) {
+            task();
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             pending_tasks.push_back(std::move(task));
@@ -521,6 +479,7 @@ public:
     }
     // 判断竞态
     channel* get_channel(int fd) {
+        if (fd < 0 || fd >= (int)channels_.size()) return nullptr;
         return channels_[fd];
     }
 
@@ -531,11 +490,9 @@ public:
         ev.data.ptr = ch;
         int fd = ch->getfd();
 
-        if (fd < 0 || fd >= (int)channels_.size()) {
-            LOG_ERROR("updatechannel fd 越界: %d", fd);
-            close(fd);
-            delete ch;
-            return;
+        // 【修复】channels_ 动态扩容：百万连接时 fd 会超过 65535，原来直接越界
+        if (fd >= (int)channels_.size()) {
+            channels_.resize(fd + 1024, nullptr);
         }
 
         int op;
@@ -550,7 +507,7 @@ public:
             perror("epoll_ctl");
             return;  // 不要exit()
         }
-        channels_[fd] = ch;  // 【修复】把 ch 存到 channels_ 数组
+        channels_[fd] = ch;  // 把 ch 存到 channels_ 数组
     }
 
     void deletechannel(channel* ch) {
@@ -571,61 +528,63 @@ public:
         ch->set_in_epoll(false);  // 标记不在 epoll 里
     }
 
+    // ========== 定时器（【修复】核心性能问题） ==========
+    // 原来 update_timer 要遍历整个 multimap 找同一个 fd：O(N)
+    // 60W 连接时每条消息都扫 60W 个节点，压测客户端一发 keepalive 风暴，主循环直接瘫痪
+    // 现在用 "fd -> multimap迭代器" 的哈希表做到 O(log N)，且同一秒内重复刷新是 O(1)
     void add_timer(int fd) {
         time_t expire = time(nullptr) + TIMEOUT_SEC;
-        timer_map_.insert({expire, fd});
-        // LOG_INFO("add_timer");
+        auto it = timer_map_.insert({expire, fd});
+        timer_pos_[fd] = it;
     }
 
     void delete_timer(int fd) {
-        for (auto it = timer_map_.begin(); it != timer_map_.end();) {
-            if (it->second == fd) {
-                it = timer_map_.erase(it);
-            } else {
-                it++;
-            }
-        }
-        // LOG_INFO("delete_timer");
+        auto pos = timer_pos_.find(fd);
+        if (pos == timer_pos_.end()) return;
+        timer_map_.erase(pos->second);
+        timer_pos_.erase(pos);
     }
 
     void update_timer(int fd) {
-        for (auto it = timer_map_.begin(); it != timer_map_.end();) {
-            if (it->second == fd) {
-                it = timer_map_.erase(it);
-            } else {
-                it++;
-            }
-        }
         time_t expire = time(nullptr) + TIMEOUT_SEC;
-        timer_map_.insert({expire, fd});
+        auto pos = timer_pos_.find(fd);
+        if (pos == timer_pos_.end()) {
+            add_timer(fd);
+            return;
+        }
+        if (pos->second->first == expire) {
+            return;  // 【关键】过期秒数没变就不动 multimap，把 O(N) 扫描变成 O(1)
+        }
+        timer_map_.erase(pos->second);
+        pos->second = timer_map_.insert({expire, fd});
     }
 
     void handle_expired() {
         time_t now = time(nullptr);
-        // LOG_DEBUG("handle_expired, timer_count=%d", timer_map_.size());
-        //  multimap 按 key（过期时间）升序排列，begin() 是最早过期的
+        // multimap 按 key（过期时间）升序排列，begin() 是最早过期的
         while (!timer_map_.empty()) {
             auto it = timer_map_.begin();
-            // LOG_DEBUG("检查 fd=%d,expire=%d,now=%d", it->second, it->first, now);
             if (it->first > now) {
                 break;  // 最早的都没过期，后面的更晚，不用检查了
             }
             int fd = it->second;
-            timer_map_.erase(it);  // 先从定时器里移除
-            // 【新增】fd 有效性检查
+            delete_timer(fd);  // 先从定时器里移除
             if (fd >= 0 && fd < (int)channels_.size()) {
-                close_connection(fd);
-            } else {
-                std::cerr << "handle_expired: 无效 fd=" << fd << std::endl;
+                close_connection(fd, "timeout");
             }
         }
     }
 
-    void close_connection(int fd);
+    // 【修复】统一关闭路径：原来 recv=0 / recv<0 / 定时器三条路各自处理，
+    // channel 和 Httprequest 只 erase 不 delete（泄漏），channel 立即 delete 又会在
+    // events 数组遍历中造成野指针。现在统一在这里摘除，channel 延迟到本轮结束再 delete。
+    // reason 用于压测诊断：观察连接到底是被谁关的
+    void close_connection(int fd, const char* reason = "unknown");
 
     // loop
     void loop() {
         looping_ = true;
+        loop_tid_ = std::this_thread::get_id();
         struct epoll_event events[MAX_EVENTS];
 
         while (looping_) {
@@ -642,6 +601,12 @@ public:
                 ch->handle_events();
             }
             handle_expired();  // 每次循环检查超时连接
+
+            // 【修复】延后删除：本轮 events 都处理完了，现在 delete 才安全
+            for (channel* ch : pending_delete_) {
+                delete ch;
+            }
+            pending_delete_.clear();
         }
     }
 
@@ -675,27 +640,112 @@ private:
     std::vector<channel*> channels_;
 
     std::multimap<time_t, int> timer_map_;
-    static const int TIMEOUT_SEC = 15;
+    // 【新增】fd -> 定时器节点迭代器，配合 update_timer 把 O(N) 降下来
+    std::unordered_map<int, std::multimap<time_t, int>::iterator> timer_pos_;
+    static const int TIMEOUT_SEC = 60;  // 【修复】15 -> 60：压测建连阶段连接本来就"没话说"，15 秒会误杀
+
+    std::vector<channel*> pending_delete_;  // 【新增】延后 delete 的 channel
 
     // runInloop
     int wakeup_fd_;
     channel* wakeup_channel_;
     std::vector<std::function<void()>> pending_tasks;
     std::mutex mutex_;
+    std::thread::id loop_tid_;  // 【新增】主循环线程 id，runInLoop 用它判断是否直接执行
 };
 // 全局变量
 eventloop* g_loop = nullptr;
 
+// 外部调用send
+void channel::write(const std::string& data) {
+    if (!write_buf.empty()) {
+        write_buf += data;
+        return;
+    }
+
+    int n_sent = send(fd_, data.c_str(), data.size(), 0);
+
+    if (n_sent == -1) {
+        // send出错
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            write_buf = data;
+            enable_write();
+        } else {
+            // 【修复】对端异常断开时（EPIPE/ECONNRESET），关闭连接而不是留一个半死连接
+            // 前面已经 signal(SIGPIPE, SIG_IGN)，不会被信号杀掉
+            g_loop->close_connection(fd_, "send-error");
+        }
+        return;
+    }
+
+    if (n_sent < (int)data.size()) {
+        write_buf += data.substr(n_sent);
+        enable_write();
+    }
+
+    // 情况4：全部发完了
+    if (n_sent == (int)data.size()) {
+        if (close_after_write_ && close_callback_) {
+            close_callback_();  // 全部发完了，走 close_callback（keep-alive 重新挂读事件）
+        }
+    }
+}
+
+// 处理writebuf
+void channel::handle_write() {
+    if (write_buf.empty()) {
+        disable_write();
+        return;
+    }
+
+    // 发送缓冲区里的数据
+    int n_sent = send(fd_, write_buf.c_str(), write_buf.size(), 0);
+
+    if (n_sent == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return;  // 又满了，等下一次 EPOLLOUT
+        }
+        // 【修复】对端异常断开，统一关闭清理
+        g_loop->close_connection(fd_, "send-error");
+        return;
+    }
+
+    // 移除已发送的部分
+    write_buf.erase(0, n_sent);
+
+    // 发完了
+    if (write_buf.empty()) {
+        disable_write();  // 【关键】取消 EPOLLOUT，否则 LT 模式下一直触发，CPU 100%
+
+        // 发完后走 close_callback（keep-alive 重新挂读事件）
+        if (close_after_write_) {
+            if (close_callback_) {
+                close_callback_();
+            }
+        }
+    }
+}
+
 void channel::enable_write() {
-    events_ |= EPOLLOUT;
-    g_loop->runInLoop([this]() {
-        g_loop->updatechannel(this);  // ✅ 丢回主线程执行
+    // 【修复】原来把 this 指针直接抓进 lambda 丢到主线程队列里，
+    // 如果任务执行前连接被定时器关闭（delete ch），这里就是 use-after-free，
+    // 然后 updatechannel 又把野指针写回 channels_，后续再 delete 一次 => double free。
+    // 现在只抓 fd，执行时重新查表，查不到就说明连接已经关了。
+    int fd = fd_;
+    g_loop->runInLoop([fd]() {
+        channel* ch = g_loop->get_channel(fd);
+        if (!ch) return;
+        ch->events_ |= EPOLLOUT;
+        g_loop->updatechannel(ch);
     });
 }
 void channel::disable_write() {
-    events_ &= ~EPOLLOUT;
-    g_loop->runInLoop([this]() {
-        g_loop->updatechannel(this);  // ✅ 丢回主线程执行
+    int fd = fd_;
+    g_loop->runInLoop([fd]() {
+        channel* ch = g_loop->get_channel(fd);
+        if (!ch) return;
+        ch->events_ &= ~EPOLLOUT;
+        g_loop->updatechannel(ch);
     });
 }
 // 请求解析状态机
@@ -722,7 +772,9 @@ public:
 
     // 核心parse
     bool parse(const char* data, int len) {
-        buffer_.append(data, len);
+        if (len > 0) {
+            buffer_.append(data, len);
+        }
 
         while (1) {
             if (state_ == REQUEST_LINE) {
@@ -782,6 +834,11 @@ public:
         }
 
         return (state_ == FINISHED);
+    }
+
+    // 【新增】已缓冲但还没解析成完整请求的字节数（handle_read 用来限制垃圾数据堆积）
+    size_t buffered() const {
+        return buffer_.size();
     }
 
     // getters
@@ -848,27 +905,30 @@ private:
 
 // 每个fd对应一个Httprequest对象，存储解析状态
 std::unordered_map<int, Httprequest*> g_http_requests;
-std::mutex g_http_mutex;  // 【新增】保护 g_http_requests
+std::mutex g_http_mutex;  // 保护 g_http_requests
 
-void eventloop::close_connection(int fd) {
-    // 【新增】fd 范围检查，防止越界
-    if (fd < 0 || fd >= (int)channels_.size()) {
-        close(fd);
-        return;
-    }
-    // LOG_DEBUG("close_connection fd=%d,channels_size=%d", fd, channels_.size());
-    channel* ch = channels_[fd];  // channels_ 数组就是 fd -> channel* 映射
+// 【新增】调试开关：M8_DUMP_REQ=1 时才打印每个请求的解析结果（原来是无条件 printf，压测时刷屏）
+static bool g_dump_requests = false;
+
+void eventloop::close_connection(int fd, const char* reason) {
+    if (fd < 0) return;
+    LOG_DEBUG("close_connection fd=%d reason=%s", fd, reason);
+    delete_timer(fd);
+    channel* ch = get_channel(fd);
     if (ch) {
         remove_from_epoll(ch);  // 从 epoll 移除
         close(fd);              // 关闭 fd
-        delete ch;              // 释放 channel
         channels_[fd] = nullptr;
+        pending_delete_.push_back(ch);  // 【修复】不在这里 delete，等本轮事件处理完
     }
     {
         std::lock_guard<std::mutex> lock(g_http_mutex);
-        g_http_requests.erase(fd);  // 【修改】只 erase，不 delete req
+        auto it = g_http_requests.find(fd);
+        if (it != g_http_requests.end()) {
+            delete it->second;  // 【修复】原来只 erase 不 delete，每个断开的连接泄漏一个 Httprequest
+            g_http_requests.erase(it);
+        }
     }
-    // LOG_INFO("关闭连接");
 }
 
 // url路径映射
@@ -986,50 +1046,57 @@ std::string make_error_response(int code, const std::string& message) {
     return response;
 }
 
-// 工作线程的read函数
-void process_request(int fd, Httprequest* req, channel* ch) {
-    // 【新增】打印当前线程 ID
-    LOG_INFO("[线程池] 线程ID:%d,处理 fd=%d,URL=%s", std::this_thread::get_id(), fd, req->getpath().c_str());
-    req->print();
+// 简单解析 body 里的 username/password（register/login 共用）
+static void parse_user_pass(const std::string& body, std::string& username, std::string& password) {
+    size_t pos = body.find("username=");
+    if (pos != std::string::npos) {
+        size_t start = pos + 9;
+        size_t end = body.find("&", start);
+        username = body.substr(start, end - start);
+    }
+    pos = body.find("password=");
+    if (pos != std::string::npos) {
+        size_t start = pos + 9;
+        password = body.substr(start);
+    }
+}
+
+// 【重构】纯函数：只根据请求字段构造响应，不碰 channel/网络
+// 原来工作线程直接拿着 channel* 和 Httprequest* 干活，主线程随时可能把连接关掉，
+// worker 用的就是野指针。现在 worker 只做"拷字段 -> 算响应"，网络收尾全部丢回主线程。
+std::string build_response(const std::string& method, const std::string& version,
+                           const std::string& connection_header, const std::string& path,
+                           const std::string& body) {
     std::string response;
     bool keep_alive = true;
     // 判断是否保持连接
-    std::string connection_header = req->getheader("Connection");
     if (connection_header == "close") {
         keep_alive = false;
-    } else if (req->getversion() == "HTTP/1.0" && connection_header != "keep-alive") {
+    } else if (version == "HTTP/1.0" && connection_header != "keep-alive") {
         keep_alive = false;
     }
 
-    if (req->getmethod() == "POST" && req->getpath() == "/register") {
+    if (method == "POST" && path == "/register") {
         // 注册：解析 body 里的 username 和 password
-        // body 格式：username=zhangsan&password=123456
-        std::string body = req->getbody();
         std::string username, password;
-        // 简单解析 body（后面再优化）
-        size_t pos = body.find("username=");
-        if (pos != std::string::npos) {
-            size_t start = pos + 9;
-            size_t end = body.find("&", start);
-            username = body.substr(start, end - start);
-        }
-        pos = body.find("password=");
-        if (pos != std::string::npos) {
-            size_t start = pos + 9;
-            password = body.substr(start);
-        }
+        parse_user_pass(body, username, password);
 
-        // 查数据库
-        ConnGuard guard(ConnPool::instance().get_conn());
-        MYSQL* conn = guard.get();
+        // 【修复】连接池拿不到连接（超时返回 nullptr）时直接 500，原来会拿 nullptr 去 mysql_query 崩掉
+        MYSQL* conn = ConnPool::instance().get_conn();
+        if (!conn) {
+            return make_error_response(500, "服务器繁忙");
+        }
+        ConnGuard guard(conn);
 
         // 先查用户名是否存在
         char sql[512];
         snprintf(sql, sizeof(sql),
                  "SELECT id FROM user WHERE username='%s'", username.c_str());
-        mysql_query(conn, sql);
-        MYSQL_RES* res = mysql_store_result(conn);
-        if (mysql_num_rows(res) > 0) {
+        MYSQL_RES* res = nullptr;
+        if (mysql_query(conn, sql) == 0) {
+            res = mysql_store_result(conn);
+        }
+        if (res && mysql_num_rows(res) > 0) {
             response += "HTTP/1.1 409 Conflict\r\n";
             response += "Content-Type: text/plain\r\n";
             response += "Content-Length: 18\r\n";
@@ -1055,32 +1122,26 @@ void process_request(int fd, Httprequest* req, channel* ch) {
                 response += "服务器错误";
             }
         }
-        mysql_free_result(res);
-    } else if (req->getmethod() == "POST" && req->getpath() == "/login") {
+        if (res) mysql_free_result(res);
+    } else if (method == "POST" && path == "/login") {
         // 登录：验证用户名密码
-        std::string body = req->getbody();
         std::string username, password;
-        size_t pos = body.find("username=");
-        if (pos != std::string::npos) {
-            size_t start = pos + 9;
-            size_t end = body.find("&", start);
-            username = body.substr(start, end - start);
-        }
-        pos = body.find("password=");
-        if (pos != std::string::npos) {
-            size_t start = pos + 9;
-            password = body.substr(start);
-        }
+        parse_user_pass(body, username, password);
 
-        ConnGuard guard(ConnPool::instance().get_conn());
-        MYSQL* conn = guard.get();
+        MYSQL* conn = ConnPool::instance().get_conn();
+        if (!conn) {
+            return make_error_response(500, "服务器繁忙");
+        }
+        ConnGuard guard(conn);
 
         char sql[512];
         snprintf(sql, sizeof(sql),
                  "SELECT password FROM user WHERE username='%s'", username.c_str());
-        mysql_query(conn, sql);
-        MYSQL_RES* res = mysql_store_result(conn);
-        MYSQL_ROW row = mysql_fetch_row(res);
+        MYSQL_RES* res = nullptr;
+        if (mysql_query(conn, sql) == 0) {
+            res = mysql_store_result(conn);
+        }
+        MYSQL_ROW row = res ? mysql_fetch_row(res) : nullptr;
         if (row && password == row[0]) {
             response += "HTTP/1.1 200 OK\r\n";
             response += "Content-Type: text/plain\r\n";
@@ -1094,34 +1155,33 @@ void process_request(int fd, Httprequest* req, channel* ch) {
             response += "\r\n";
             response += "用户名或密码错误";
         }
-        mysql_free_result(res);
-    } else if (req->getmethod() == "GET") {
+        if (res) mysql_free_result(res);
+    } else if (method == "GET") {
         // url映射
-        std::string file_path = url_to_path(req->getpath());
-        LOG_INFO("Mapped URL: %s to file path: %s", req->getpath().c_str(), file_path.c_str());
+        std::string file_path = url_to_path(path);
+        LOG_DEBUG("Mapped URL: %s to file path: %s", path.c_str(), file_path.c_str());
         // 2.检查非法路径
         if (file_path.empty()) {
             response = make_error_response(403, "Forbidden");
         } else {
             // 3.检查文件是否存在
-            std::string body;
-            if (!read_file(file_path, body)) {
+            std::string resp_body;
+            if (!read_file(file_path, resp_body)) {
                 response = make_error_response(404, "Not Found");
-                LOG_INFO("File not found:%s, sending 404 response. ", file_path.c_str());
+                LOG_DEBUG("File not found:%s, sending 404 response. ", file_path.c_str());
             } else {
                 // 4.文件存在，构造200响应
                 std::string content_type = get_content_type(file_path);
-                LOG_INFO("Serving file:%swith Content-Type:%s", file_path.c_str(), content_type.c_str());
-                LOG_INFO("File size:%dbytes", body.size());
+                LOG_DEBUG("Serving file:%s with Content-Type:%s", file_path.c_str(), content_type.c_str());
                 response += "HTTP/1.1 200 OK\r\n";
-                response += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+                response += "Content-Length: " + std::to_string(resp_body.size()) + "\r\n";
                 response += "Content-Type: " + content_type + "\r\n";
                 response += "\r\n";
-                response += body;
+                response += resp_body;
             }
         }
     } else {
-        LOG_INFO("Unsupported HTTP method:%s, sending 405 response.", req->getmethod().c_str());
+        LOG_DEBUG("Unsupported HTTP method:%s, sending 405 response.", method.c_str());
         response = make_error_response(405, "Method Not Allowed");
     }
 
@@ -1132,45 +1192,78 @@ void process_request(int fd, Httprequest* req, channel* ch) {
                                 std::string(keep_alive ? "keep-alive" : "close") + "\r\n";
         response.insert(header_end + 2, conn_line);
     }
+    return response;
+}
 
-    // 【修改】发完响应后的回调：不再关闭连接，而是重新注册读事件
-    ch->set_close_callback([fd]() {
-        // 用 runInLoop 把"重新注册读事件"丢回主线程执行
-        g_loop->runInLoop([fd]() {
+// 【新增】把"解析完成的请求"提交给线程池（after_response 在它前面用到，前置声明）
+void submit_request(int fd);
+
+// 【新增】响应写完后的收尾：重新挂读事件 + 刷新定时器 + 处理粘包
+// （原来是 set_close_callback 里的一段匿名 lambda，现在提出来看得清楚）
+void after_response(int fd) {
+    channel* ch = g_loop->get_channel(fd);
+    if (!ch) {
+        return;  // 连接已经被关闭
+    }
+
+    Httprequest* req = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_http_mutex);
+        auto it = g_http_requests.find(fd);
+        if (it == g_http_requests.end()) return;
+        req = it->second;
+    }
+    req->reset();
+
+    // 重新注册读事件（ch 可能之前被 remove_from_epoll 了，所以走 ADD 分支）
+    ch->setreadevents();
+    g_loop->updatechannel(ch);
+
+    // 更新定时器
+    g_loop->update_timer(fd);
+
+    // 【粘包处理】检查 buffer_ 里是否还有完整的请求
+    // 如果有，立即提交任务处理（不需要等新的网络数据）
+    if (req->parse(nullptr, 0)) {
+        g_loop->remove_from_epoll(ch);
+        submit_request(fd);
+    }
+}
+
+// 【新增】把"解析完成的请求"提交给线程池
+// handle_read 解析完调用；after_response 发现粘包时也调用
+void submit_request(int fd) {
+    g_pool->submit([fd]() {
+        // 1. 在锁内把需要的字段拷贝出来——worker 之后不再持有 req/channel 指针，
+        //    主线程随时可以关闭连接、delete 对象，不会产生悬空指针
+        std::string method, path, version, connhdr, body;
+        {
+            std::lock_guard<std::mutex> lock(g_http_mutex);
+            auto it = g_http_requests.find(fd);
+            if (it == g_http_requests.end()) return;
+            Httprequest* req = it->second;
+            method = req->getmethod();
+            path = req->getpath();
+            version = req->getversion();
+            connhdr = req->getheader("Connection");
+            body = req->getbody();
+        }
+
+        if (g_dump_requests) {
+            printf("===== fd=%d %s %s %s =====\n", fd, method.c_str(), path.c_str(), version.c_str());
+        }
+        LOG_DEBUG("worker processing fd=%d, URL=%s", fd, path.c_str());
+
+        // 2. 纯计算：构造响应（读文件/查库都在这里做）
+        std::string response = build_response(method, version, connhdr, path, body);
+
+        // 3. 网络发送丢回主线程（channel 只允许主线程碰）
+        g_loop->runInLoop([fd, response]() {
             channel* ch = g_loop->get_channel(fd);
-            if (!ch) {
-                return;
-            }
-
-            Httprequest* req;
-            {
-                std::lock_guard<std::mutex> lock(g_http_mutex);
-                auto it = g_http_requests.find(fd);
-                if (it == g_http_requests.end()) return;
-                req = it->second;
-            }
-            req->reset();
-
-            // 2. 重新注册读事件（ch 可能之前被 deletechannel 了，所以走 ADD 分支）
-            ch->setreadevents();
-            g_loop->updatechannel(ch);
-
-            // 3. 更新定时器
-            g_loop->update_timer(fd);
-
-            // 4. 【粘包处理】检查 buffer_ 里是否还有完整的请求
-            //    如果有，立即提交任务处理（不需要等新的网络数据）
-            if (req->parse("", 0)) {
-                g_loop->remove_from_epoll(ch);
-                process_request(fd, req, ch);
-            }
+            if (!ch) return;  // 连接已经被关闭，直接丢弃响应
+            ch->write(response);
         });
     });
-
-    ch->set_close_after_write(true);  // 短连接：发完就关
-
-    // 【修改】不再自己循环 send，交给 channel 异步发送
-    ch->write(response);
 }
 
 // 已连接fd的读处理函数
@@ -1179,112 +1272,124 @@ void handle_read(channel* ch) {
     char buf[1024];
 
     // 检查http连接
-    std::unordered_map<int, Httprequest*>::iterator it;
+    Httprequest* req = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_http_mutex);
-        it = g_http_requests.find(fd);
+        auto it = g_http_requests.find(fd);
+        if (it != g_http_requests.end()) {
+            req = it->second;
+        }
     }
 
-    if (it == g_http_requests.end()) {
-        // g_loop->deletechannel(ch);
+    if (req == nullptr) {
         g_loop->delete_timer(fd);
         close(fd);
-        // delete ch;
         return;
     }
-    Httprequest* req = it->second;
 
     while (1) {
-        memset(buf, 0, sizeof(buf));
         int n = recv(fd, buf, sizeof(buf), 0);
         if (n == 0) {
-            g_loop->deletechannel(ch);
-            g_loop->delete_timer(fd);
-            close(fd);
-            // 不 delete ch 和 req，标记待删除，让 handle_expired 统一清理
-            {
-                std::lock_guard<std::mutex> lock(g_http_mutex);
-                g_http_requests.erase(fd);
-            }
+            // 对端正常关闭：统一走 close_connection（原来这里只 erase，channel 和 req 都泄漏）
+            g_loop->close_connection(fd, "peer-close");
             break;
         } else if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             } else {
-                perror("recv");
-                g_loop->remove_from_epoll(ch);
-                g_loop->delete_timer(fd);
-                close(fd);
-                // 不 delete ch 和 req，让 close_connection 统一清理
-                {
-                    std::lock_guard<std::mutex> lock(g_http_mutex);
-                    g_http_requests.erase(fd);
-                }
+                if (errno != ECONNRESET) perror("recv");
+                g_loop->close_connection(fd, "recv-error");
                 break;
             }
         }
         g_loop->update_timer(fd);
         bool done = req->parse(buf, n);
+        if (!done && req->buffered() > GARBAGE_BUF_LIMIT) {
+            // 【新增】不是 HTTP 流量（比如压测客户端的裸文本），请求行永远等不到 \r\n，
+            // 原来这些字节会永远堆在 buffer_ 里（60W 连接 × 每次压测涨几十字节 = 纯浪费）
+            g_loop->close_connection(fd, "garbage-buffer");
+            break;
+        }
         if (done) {
-            LOG_INFO("parse done, fd=%d, submitting to pool", fd);
+            LOG_DEBUG("parse done, fd=%d, submitting to pool", fd);
             g_loop->remove_from_epoll(ch);
-            g_pool->submit([fd]() {
-                channel* ch = g_loop->get_channel(fd);
-                if (!ch) return;
-                Httprequest* req;
-                {
-                    std::lock_guard<std::mutex> lock(g_http_mutex);
-                    auto it = g_http_requests.find(fd);
-                    if (it == g_http_requests.end()) return;
-                    req = it->second;
-                }
-                process_request(fd, req, ch);
-            });
+            submit_request(fd);
             break;
         }
     }
 }
 // listenfd的accept处理函数
 void handle_accept(channel* ch) {
-    struct sockaddr_in client_addr;
-    socklen_t len = sizeof(client_addr);
+    int listenfd = ch->getfd();
 
-    int connfd = accept(ch->getfd(), (struct sockaddr*)&client_addr, &len);
-    if (connfd == -1) {
-        perror("accept");
-        return;
+    // 【修复】一次性把 backlog 里的连接全部 accept 干净
+    // 原来一次 epoll 事件只 accept 一个，客户端 2W/s 建连时 backlog 堆积、connect 延迟暴涨
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t len = sizeof(client_addr);
+
+        int connfd = accept(listenfd, (struct sockaddr*)&client_addr, &len);
+        if (connfd == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno == EINTR) continue;
+            if (errno == EMFILE) {
+                // fd 用完了：ulimit 不够，不能再 accept，否则 LT 模式下死循环
+                LOG_ERROR("accept: EMFILE, 请调大 ulimit -n");
+                break;
+            }
+            perror("accept");
+            break;
+        }
+
+        // 设置非阻塞
+        int flags = fcntl(connfd, F_GETFL, 0);
+        flags |= O_NONBLOCK;
+        int ret = fcntl(connfd, F_SETFL, flags);
+        if (ret == -1) {
+            perror("fcntl F_SETFL");
+        }
+
+        // 【新增】禁用 Nagle：压测的"一发一收"模式会被 40ms 延迟确认拖慢一个量级
+        int nodelay = 1;
+        setsockopt(connfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+        channel* client_ch = new channel(connfd);
+        client_ch->setreadevents();
+
+        client_ch->setreadcallback([client_ch]() {
+            handle_read(client_ch);
+        });
+
+        // 【重构】close_callback 每个连接只需要设一次（原来是每个请求 set 一次，内容一模一样）
+        client_ch->set_close_callback([connfd]() {
+            g_loop->runInLoop([connfd]() {
+                after_response(connfd);
+            });
+        });
+        client_ch->set_close_after_write(true);  // 响应发完触发 close_callback -> after_response
+
+        g_loop->updatechannel(client_ch);
+        // 创建一个新的http连接
+        {
+            std::lock_guard<std::mutex> lock(g_http_mutex);
+            g_http_requests[connfd] = new Httprequest();
+        }
+        g_loop->add_timer(connfd);
     }
-    // 设置非阻塞
-    int flags = fcntl(connfd, F_GETFL, 0);
-    flags |= O_NONBLOCK;
-    int ret = fcntl(connfd, F_SETFL, flags);
-    if (ret == -1) {
-        perror("fcntl F_SETFL");
-    }
-
-    channel* client_ch = new channel(connfd);
-    client_ch->setreadevents();
-
-    client_ch->setreadcallback([client_ch]() {
-        handle_read(client_ch);
-    });
-
-    g_loop->updatechannel(client_ch);
-    // 创建一个新的http连接
-    {
-        std::lock_guard<std::mutex> lock(g_http_mutex);
-        g_http_requests[connfd] = new Httprequest();
-    }
-    g_loop->add_timer(connfd);
 }
 int main() {
+    // 【新增】忽略 SIGPIPE：向已被客户端关闭的 socket send 会触发 SIGPIPE，
+    // 默认行为是直接杀进程——压测时大量连接断开，服务器会莫名其妙死掉
+    signal(SIGPIPE, SIG_IGN);
+    g_dump_requests = (getenv("M8_DUMP_REQ") != nullptr);
+
     g_loop = new eventloop();
     Logger::instance().init("server.log");
     ConnPool::instance().init("localhost", "lip", "123456", "webserver", 8);
     g_pool = new Threadpool(4);
 
     // 循环监听 20 个端口
-    for (int i = 0; i < 20; i++) {
+    for (int i = 0; i < 40; i++) {
         int listenfd = socket(AF_INET, SOCK_STREAM, 0);
         if (listenfd == -1) {
             perror("socket");
@@ -1301,14 +1406,15 @@ int main() {
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(9000 + i);
+        addr.sin_port = htons(9000 + i);  // 9000~9019
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
         if (bind(listenfd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
             perror("bind");
             exit(1);
         }
-        if (listen(listenfd, SOMAXCONN) == -1) {
+        // 【修复】SOMAXCONN 头文件常量是 4096，listen 要显式给大值才能用满 somaxconn=65535
+        if (listen(listenfd, 65535) == -1) {
             perror("listen");
             exit(1);
         }
@@ -1319,7 +1425,7 @@ int main() {
         g_loop->updatechannel(listen_ch);
     }
 
-    std::cout << "服务器启动，监听 9000~9019 端口" << std::endl;
+    std::cout << "服务器启动，监听 9000~9039 端口" << std::endl;
     g_loop->loop();
     return 0;
 }
